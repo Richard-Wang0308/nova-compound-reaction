@@ -24,6 +24,7 @@ class BoltzWriter(BasePredictionWriter):
         output_format: Literal["pdb", "mmcif"] = "mmcif",
         boltz2: bool = False,
         write_embeddings: bool = False,
+        skip_full_structures: bool = False,  # Skip PDB/mmCIF when only affinity needed
     ) -> None:
         """Initialize the writer.
 
@@ -45,6 +46,7 @@ class BoltzWriter(BasePredictionWriter):
         self.boltz2 = boltz2
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.write_embeddings = write_embeddings
+        self.skip_full_structures = skip_full_structures  # Skip PDB/mmCIF files when only affinity needed
 
     def write_on_batch_end(
         self,
@@ -158,27 +160,33 @@ class BoltzWriter(BasePredictionWriter):
                 # Create path name
                 outname = f"{record.id}_model_{idx_to_rank[model_idx]}"
 
-                # Save the structure
-                if self.output_format == "pdb":
-                    path = struct_dir / f"{outname}.pdb"
-                    with path.open("w") as f:
-                        f.write(
-                            to_pdb(new_structure, plddts=plddts, boltz2=self.boltz2)
-                        )
-                elif self.output_format == "mmcif":
-                    path = struct_dir / f"{outname}.cif"
-                    with path.open("w") as f:
-                        f.write(
-                            to_mmcif(new_structure, plddts=plddts, boltz2=self.boltz2)
-                        )
-                else:
-                    path = struct_dir / f"{outname}.npz"
-                    np.savez_compressed(path, **asdict(new_structure))
-
+                # Save pre_affinity file (required for affinity prediction)
                 if self.boltz2 and record.affinity and idx_to_rank[model_idx] == 0:
                     path = struct_dir / f"pre_affinity_{record.id}.npz"
                     np.savez_compressed(path, **asdict(new_structure))
                     np.array(atoms["coords"][:, None], dtype=Coords)
+
+                # Skip full structure output (PDB/mmCIF) when only affinity is needed (saves 5-10s I/O)
+                if self.skip_full_structures and record.affinity:
+                    # Only write pre_affinity file, skip PDB/mmCIF files
+                    pass
+                else:
+                    # Save the full structure (PDB/mmCIF/NPZ)
+                    if self.output_format == "pdb":
+                        path = struct_dir / f"{outname}.pdb"
+                        with path.open("w") as f:
+                            f.write(
+                                to_pdb(new_structure, plddts=plddts, boltz2=self.boltz2)
+                            )
+                    elif self.output_format == "mmcif":
+                        path = struct_dir / f"{outname}.cif"
+                        with path.open("w") as f:
+                            f.write(
+                                to_mmcif(new_structure, plddts=plddts, boltz2=self.boltz2)
+                            )
+                    else:
+                        path = struct_dir / f"{outname}.npz"
+                        np.savez_compressed(path, **asdict(new_structure))
 
                 # Save confidence summary
                 if "plddt" in prediction:

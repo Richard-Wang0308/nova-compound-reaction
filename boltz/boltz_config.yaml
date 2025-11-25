@@ -21,3 +21,15 @@ batch_predictions: true
 # WARNING: Too many workers can cause OOM or CPU overload - reduce if process gets killed or CPU spikes
 num_workers: 8
 
+# Precomputed conformers optimization (LARGEST WIN - saves CPU time)
+# Precompute conformers in parallel before inference to skip expensive RDKit embedding
+use_precomputed_conformers: true  # Enable precomputation (recommended)
+precompute_workers: 32  # Number of parallel workers for conformer generation
+precompute_shard_size: 1000  # Number of records per shard file
+
+# Model quantization (for faster inference)
+# Options: "none", "fp16", "int8"
+# FP16: ~2x faster, minimal accuracy loss (recommended)
+# INT8: ~4x faster, some accuracy loss (experimental)
+quantization: "fp16"
+

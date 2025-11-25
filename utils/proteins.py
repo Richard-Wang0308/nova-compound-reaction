@@ -6,99 +6,33 @@ from datasets import load_dataset
 
 def get_protein_treat_model(protein_code: str) -> str:
     """
-    Determine which TREAT model to use based on protein type.
+    Determine which TREAT model to use based on protein sequence length.
+    
+    This is the official Metanova rule used in miner reference implementation:
+    - ≤ 400 amino acids → TREAT-1 (trained on shorter transporters and GPCR-like sequences)
+    - > 400 amino acids → TREAT-2 (trained on longer HDAC-like enzymes and multi-domain proteins)
     
     Returns:
-        'TREAT1' for monoamine transporters (SERT, DAT, NET)
-        'TREAT2' for HDACs (histone deacetylases)
-        'TREAT1' as default for other proteins
+        'TREAT1' if sequence length ≤ 400
+        'TREAT2' if sequence length > 400
+        'TREAT1' as default if sequence cannot be retrieved
     """
     try:
-        url = f"https://rest.uniprot.org/uniprotkb/{protein_code}.json"
-        response = requests.get(url, timeout=10)
+        # Get protein sequence
+        sequence = get_sequence_from_protein_code(protein_code)
         
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Check protein name and description
-            protein_name = ""
-            description = ""
-            
-            # Get recommended name
-            if "proteinDescription" in data:
-                rec_name = data["proteinDescription"].get("recommendedName", {})
-                if rec_name:
-                    protein_name = rec_name.get("fullName", {}).get("value", "").lower()
-                
-                # Get alternative names
-                alt_names = data["proteinDescription"].get("alternativeNames", [])
-                for alt in alt_names:
-                    alt_name = alt.get("fullName", {}).get("value", "").lower()
-                    description += " " + alt_name
-            
-            # Get gene names
-            genes = data.get("genes", [])
-            for gene in genes:
-                gene_names = gene.get("geneName", {})
-                if gene_names:
-                    value = gene_names.get("value", "").lower()
-                    description += " " + value
-            
-            # Get keywords and features
-            keywords = data.get("keywords", [])
-            for kw in keywords:
-                kw_value = kw.get("value", "").lower()
-                description += " " + kw_value
-            
-            # Check for monoamine transporters (TREAT-1)
-            monoamine_keywords = [
-                "serotonin transporter", "sert", "slc6a4",
-                "dopamine transporter", "dat", "slc6a3",
-                "norepinephrine transporter", "net", "slc6a2",
-                "monoamine transporter", "solute carrier family 6"
-            ]
-            
-            # Check for HDACs (TREAT-2)
-            hdac_keywords = [
-                "histone deacetylase", "hdac", "histone deacetylase complex"
-            ]
-            
-            full_text = (protein_name + " " + description).lower()
-            
-            # Check for HDACs first (more specific)
-            for keyword in hdac_keywords:
-                if keyword in full_text:
-                    bt.logging.info(f"Protein {protein_code} identified as HDAC, using TREAT-2")
-                    return "TREAT2"
-            
-            # Check for monoamine transporters
-            for keyword in monoamine_keywords:
-                if keyword in full_text:
-                    bt.logging.info(f"Protein {protein_code} identified as monoamine transporter, using TREAT-1")
-                    return "TREAT1"
-            
-            # Check Pfam/InterPro domains
-            if "uniProtKBCrossReferences" in data:
-                for ref in data["uniProtKBCrossReferences"]:
-                    database = ref.get("database", "").lower()
-                    if database in ["pfam", "interpro"]:
-                        ref_id = ref.get("id", "").lower()
-                        properties = ref.get("properties", [])
-                        prop_values = " ".join([p.get("value", "").lower() for p in properties])
-                        
-                        # Check for HDAC domains
-                        if "hist_deacetylase" in ref_id or "hist_deacetylase" in prop_values:
-                            bt.logging.info(f"Protein {protein_code} has HDAC domain, using TREAT-2")
-                            return "TREAT2"
-                        
-                        # Check for SLC6 family (monoamine transporters)
-                        if "slc6" in ref_id or "solute carrier" in prop_values:
-                            bt.logging.info(f"Protein {protein_code} has SLC6 domain, using TREAT-1")
-                            return "TREAT1"
+        if sequence is None or len(sequence) == 0:
+            bt.logging.warning(f"Could not retrieve sequence for {protein_code}, defaulting to TREAT-1")
+            return "TREAT1"
         
-        # Default to TREAT-1 if we can't determine
-        bt.logging.info(f"Could not determine protein type for {protein_code}, defaulting to TREAT-1")
-        return "TREAT1"
+        # Determine model based on sequence length
+        seq_length = len(sequence)
+        if seq_length <= 400:
+            bt.logging.info(f"Protein {protein_code} has sequence length {seq_length} (≤ 400), using TREAT-1")
+            return "TREAT1"
+        else:
+            bt.logging.info(f"Protein {protein_code} has sequence length {seq_length} (> 400), using TREAT-2")
+            return "TREAT2"
         
     except Exception as e:
         bt.logging.warning(f"Error determining TREAT model for {protein_code}: {e}, defaulting to TREAT-1")

@@ -615,7 +615,7 @@ def setup_gpu_devices():
     else:
         bt.logging.error("CUDA not available. Two-stage pipeline requires GPU support.")
 
-
+@profile  
 async def stage1_psichic_prefilter(
     state: Dict[str, Any],
     psichic_queue: asyncio.Queue,
@@ -770,7 +770,7 @@ async def stage1_psichic_prefilter(
     
     # No need to maintain PSICHIC top pool - Boltz-2 maintains the final top pool
 
-
+@profile
 async def stage2_boltz_scorer(
     state: Dict[str, Any],
     psichic_queue: asyncio.Queue,
@@ -947,7 +947,7 @@ async def stage2_boltz_scorer(
     
     return state.get('boltz_top_pool', pd.DataFrame())
 
-
+@profile
 async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
     """
     Two-stage scoring pipeline:
@@ -1000,7 +1000,7 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
     # Two-stage pipeline hyperparameters
     # Stage 1: Generate and pre-screen with PSICHIC
     # Generate 10K-50K molecules per iteration for PSICHIC pre-filtering (adjustable based on GPU capacity)
-    n_samples_per_reaction = 10000  # 10K per reaction = 20K total for PSICHIC pre-filtering (optimized for 2x RTX 3090)
+    n_samples_per_reaction = 25  # 10K per reaction = 20K total for PSICHIC pre-filtering (optimized for 2x RTX 3090)
     
     # Queue for communication between stages
     psichic_queue = asyncio.Queue(maxsize=10)  # Queue for passing candidates to Boltz-2
@@ -1097,9 +1097,9 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
                     bt.logging.info(f"Boltz-2 top pool - Avg: {current_boltz_pool['boltz_score'].mean():.4f}, Max: {current_boltz_pool['boltz_score'].max():.4f}, Size: {len(current_boltz_pool)}, Improvement: {score_improvement_rate*100:.2f}%")
             
             # Check for submission (based on Boltz-2 scores in state)
-                    current_block = await state['subtensor'].get_current_block()
-                    next_epoch_block = ((current_block // state['epoch_length']) + 1) * state['epoch_length']
-                    blocks_until_epoch = next_epoch_block - current_block
+            current_block = await state['subtensor'].get_current_block()
+            next_epoch_block = ((current_block // state['epoch_length']) + 1) * state['epoch_length']
+            blocks_until_epoch = next_epoch_block - current_block
                     
             bt.logging.debug(f"Current block: {current_block}, Blocks until epoch: {blocks_until_epoch}")
             
@@ -1221,7 +1221,7 @@ async def submit_response(state: Dict[str, Any]) -> None:
 # ----------------------------------------------------------------------------
 # 6. MAIN MINING LOOP
 # ----------------------------------------------------------------------------
-
+@profile
 async def run_miner(config: argparse.Namespace) -> None:
     """
     The main mining loop, orchestrating:

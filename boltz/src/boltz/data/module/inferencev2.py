@@ -23,6 +23,20 @@ from boltz.data.types import (
     StructureV2,
 )
 
+# Import precomputed conformer loader
+try:
+    import sys
+    import os
+    # Add parent directory to path to import precompute_conformers
+    parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    from boltz.precompute_conformers import load_precomputed_conformer
+except ImportError:
+    # Fallback if module not available
+    def load_precomputed_conformer(*args, **kwargs):
+        return None
+
 
 def load_input(
     record: Record,
@@ -168,6 +182,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         extra_mols_dir: Optional[Path] = None,
         override_method: Optional[str] = None,
         affinity: bool = False,
+        precomputed_conformers_dir: Optional[Path] = None,  # Optional directory with precomputed conformers
     ) -> None:
         """Initialize the training dataset.
 
@@ -200,6 +215,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         self.extra_mols_dir = extra_mols_dir
         self.override_method = override_method
         self.affinity = affinity
+        self.precomputed_conformers_dir = Path(precomputed_conformers_dir) if precomputed_conformers_dir else None
         if self.affinity:
             self.cropper = AffinityCropper()
 
@@ -329,6 +345,7 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         extra_mols_dir: Optional[Path] = None,
         override_method: Optional[str] = None,
         affinity: bool = False,
+        precomputed_conformers_dir: Optional[Path] = None,  # Optional directory with precomputed conformers
     ) -> None:
         """Initialize the DataModule.
 
@@ -365,6 +382,11 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         self.extra_mols_dir = extra_mols_dir
         self.override_method = override_method
         self.affinity = affinity
+        # Store precomputed_conformers_dir (convert to Path if provided, otherwise None)
+        if precomputed_conformers_dir is not None:
+            self.precomputed_conformers_dir = Path(precomputed_conformers_dir)
+        else:
+            self.precomputed_conformers_dir = None
 
     def predict_dataloader(self) -> DataLoader:
         """Get the training dataloader.
@@ -375,6 +397,9 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
             The training dataloader.
 
         """
+        # Get precomputed_conformers_dir with fallback (defensive programming)
+        precomputed_dir = getattr(self, 'precomputed_conformers_dir', None)
+        
         dataset = PredictionDataset(
             manifest=self.manifest,
             target_dir=self.target_dir,
@@ -385,6 +410,7 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
             extra_mols_dir=self.extra_mols_dir,
             override_method=self.override_method,
             affinity=self.affinity,
+            precomputed_conformers_dir=precomputed_dir,
         )
         return DataLoader(
             dataset,

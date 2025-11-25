@@ -942,6 +942,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     ccd: Mapping[str, Mol],
     mol_dir: Optional[Path] = None,
     boltz_2: bool = False,
+    precomputed_conformers_dir: Optional[Path] = None,  # Optional directory with precomputed conformers
 ) -> Target:
     """Parse a Boltz input yaml / json.
 
@@ -1245,10 +1246,41 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     raise ValueError(msg)
                 atom.SetProp("name", atom_name)
 
-            success = compute_3d_conformer(mol)
-            if not success:
-                msg = f"Failed to compute 3D conformer for {seq}"
-                raise ValueError(msg)
+            # Try to load precomputed conformer first (FAST PATH - saves CPU time)
+            conformer_loaded = False
+            if precomputed_conformers_dir is not None:
+                try:
+                    # Try to load precomputed conformer using molecule name/ID
+                    # The name format from wrapper is "mol_{mol_idx}" where mol_idx comes from record.id
+                    product_name = f"mol_{name}"  # name is the record.id from YAML file
+                    import sys
+                    import os
+                    # Add parent directory to path to import precompute_conformers
+                    parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+                    if parent_dir not in sys.path:
+                        sys.path.insert(0, parent_dir)
+                    from boltz.precompute_conformers import load_precomputed_conformer
+                    precomputed = load_precomputed_conformer(product_name, precomputed_conformers_dir)
+                    
+                    if precomputed is not None:
+                        # Inject precomputed conformer into Mol object
+                        conf = mol.GetConformer(0) if mol.GetNumConformers() > 0 else Chem.Conformer(mol.GetNumAtoms())
+                        for i, coord in enumerate(precomputed["coords"]):
+                            if i < mol.GetNumAtoms():
+                                conf.SetAtomPosition(i, tuple(coord))
+                        if mol.GetNumConformers() == 0:
+                            mol.AddConformer(conf)
+                        conformer_loaded = True
+                except Exception:
+                    # Fall back to computing conformer if precomputed load fails
+                    pass
+
+            # Compute conformer if not precomputed (SLOW PATH)
+            if not conformer_loaded:
+                success = compute_3d_conformer(mol)
+                if not success:
+                    msg = f"Failed to compute 3D conformer for {seq}"
+                    raise ValueError(msg)
 
             mol_no_h = AllChem.RemoveHs(mol, sanitize=False)
             affinity_mw = Descriptors.MolWt(mol_no_h) if affinity else None
