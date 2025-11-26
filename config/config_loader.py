@@ -23,6 +23,8 @@ def load_config(path: str = "config/config.yaml"):
     min_heavy_atoms = validation_config["min_heavy_atoms"]
     min_rotatable_bonds = validation_config["min_rotatable_bonds"]
     max_rotatable_bonds = validation_config["max_rotatable_bonds"]
+    prefilter_mw_max = validation_config.get("prefilter_mw_max", 550.0)
+    prefilter_tpsa_max = validation_config.get("prefilter_tpsa_max", 140.0)
     num_molecules = validation_config["num_molecules"]
     entropy_bonus_threshold = validation_config["entropy_bonus_threshold"]
     entropy_start_weight = validation_config["entropy_start_weight"]
@@ -52,6 +54,8 @@ def load_config(path: str = "config/config.yaml"):
         'min_heavy_atoms': min_heavy_atoms,
         'min_rotatable_bonds': min_rotatable_bonds,
         'max_rotatable_bonds': max_rotatable_bonds,
+        'prefilter_mw_max': prefilter_mw_max,
+        'prefilter_tpsa_max': prefilter_tpsa_max,
         'num_molecules': num_molecules,
         'entropy_bonus_threshold': entropy_bonus_threshold,
         'entropy_start_weight': entropy_start_weight,

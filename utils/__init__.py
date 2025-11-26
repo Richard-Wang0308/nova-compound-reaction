@@ -4,7 +4,8 @@ from .molecules import (
     compute_maccs_entropy,
     molecule_unique_for_protein_hf,
     find_chemically_identical,
-    is_boltz_safe_smiles
+    is_boltz_safe_smiles,
+    ultra_light_prefilter
 )
 from .proteins import get_sequence_from_protein_code, get_challenge_params_from_blockhash, get_protein_treat_model
 from .github import upload_file_to_github

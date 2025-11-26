@@ -1005,10 +1005,16 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     # FP16 quantization requires precision="16-mixed" for automatic mixed precision (AMP)
     # This handles dtype conversions automatically and avoids Float/Half mismatches
     if quantization == "fp16":
-        trainer_precision = "16-mixed"  # Automatic mixed precision (FP16 where safe, FP32 where needed)
+        # Use "16-mixed" (AMP) instead of "16-true" to avoid frozen dataclass errors
+        # "16-true" tries to convert everything including frozen dataclasses, causing errors
+        # "16-mixed" only converts tensors and is safer with complex data structures
+        # Still provides significant speedup (~1.5-2x) while being compatible
+        trainer_precision = "16-mixed"  # Automatic mixed precision (safe with frozen dataclasses)
         click.echo("Using FP16 with automatic mixed precision (AMP) for faster inference")
+        click.echo(f"Trainer precision set to: {trainer_precision}")
     else:
         trainer_precision = "32-true"  # Full FP32 precision
+        click.echo(f"Using FP32 precision (quantization={quantization})")
     
     trainer = Trainer(
         default_root_dir=out_dir,
@@ -1020,6 +1026,12 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         deterministic=True, 
         benchmark=False
     )
+    
+    # Log actual precision plugin to verify FP16 is active
+    if quantization == "fp16":
+        click.echo(f"Trainer precision plugin: {type(trainer.precision_plugin).__name__}")
+        if hasattr(trainer.precision_plugin, '_desired_input_dtype'):
+            click.echo(f"Desired input dtype: {trainer.precision_plugin._desired_input_dtype}")
 
     if filtered_manifest.records:
         msg = f"Running structure prediction for {len(filtered_manifest.records)} input"

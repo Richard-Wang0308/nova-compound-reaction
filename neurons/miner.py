@@ -42,6 +42,7 @@ from utils import (
     get_heavy_atom_count,
     compute_maccs_entropy,
     is_reaction_allowed,
+    ultra_light_prefilter,
 )
 from PSICHIC.wrapper import PsichicWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -546,17 +547,33 @@ def generate_valid_molecules_batch(rxn_ids: List[int], n_samples_per_reaction: i
                     rxn_id, batch_size_actual, molecules_A, molecules_B, molecules_C, is_three_component, rxn_component_weights
                 )
             
-            # Validate molecules (CPU-intensive RDKit operations)
+            # Validate molecules with ultra-light prefilter (CPU-intensive RDKit operations)
+            # Get prefilter thresholds from config
+            rot_min = config.min_rotatable_bonds
+            rot_max = config.max_rotatable_bonds
+            heavy_min = config.min_heavy_atoms
+            mw_max = getattr(config, 'prefilter_mw_max', 550.0)
+            tpsa_max = getattr(config, 'prefilter_tpsa_max', 140.0)
+            
+            # Track rejection reasons for diagnostics (optional)
+            rejection_counts = {}
+            
             for idx, name in enumerate(batch_molecules):
                 try:
                     smiles = get_smiles_from_reaction(name)
                     if not smiles:
                         continue
                     
-                    if get_heavy_atom_count(smiles) < config.min_heavy_atoms:
+                    # Ultra-light prefilter: checks rotatable bonds, heavy atoms, MW, and TPSA in one pass
+                    # This is more efficient than checking each property separately
+                    ok, reason = ultra_light_prefilter(smiles, rot_min, rot_max, heavy_min, mw_max, tpsa_max)
+                    if not ok:
+                        # Optional: count rejection reasons for diagnostics
+                        if reason:
+                            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
                         continue
                     
-                    # Check InChIKey for uniqueness
+                    # Check InChIKey for uniqueness (only after passing prefilter to avoid duplicate Mol creation)
                     mol = Chem.MolFromSmiles(smiles)
                     if not mol:
                         continue
@@ -572,6 +589,10 @@ def generate_valid_molecules_batch(rxn_ids: List[int], n_samples_per_reaction: i
                         break
                 except Exception:
                     continue
+            
+            # Optional: Log rejection statistics for tuning (only if significant rejections)
+            if rejection_counts and len(valid_molecules) < n_samples_per_reaction * 0.5:
+                bt.logging.debug(f"Prefilter rejections (rxn {rxn_id}): {dict(sorted(rejection_counts.items(), key=lambda x: x[1], reverse=True)[:5])}")
                 
                 # Yield every 100 molecules to prevent CPU spinning (if called from async context)
                 # Note: This function is synchronous, but we can't await here
@@ -878,15 +899,22 @@ async def stage2_boltz_scorer(
                     per_molecule_scores = boltz_wrapper.per_molecule_metric.get(MINER_UID, {})
                     
                     # Store results - use per-molecule scores if available, otherwise use average
+                    # Ensure all arrays have the same length to avoid DataFrame errors
                     for i, (name, smiles) in enumerate(zip(batch_names, batch_smiles)):
                         all_names.append(name)
                         all_smiles.append(smiles)
                         # Get per-molecule score if available, otherwise use average
                         if smiles in per_molecule_scores:
-                            all_boltz_scores.append(float(per_molecule_scores[smiles]))
+                            score = per_molecule_scores[smiles]
+                            # Handle None values
+                            if score is not None:
+                                all_boltz_scores.append(float(score))
+                            else:
+                                avg_score = score_dict_boltz[MINER_UID].get('boltz_score', -math.inf)
+                                all_boltz_scores.append(float(avg_score) if avg_score != -math.inf and avg_score is not None else -math.inf)
                         else:
                             avg_score = score_dict_boltz[MINER_UID].get('boltz_score', -math.inf)
-                            all_boltz_scores.append(float(avg_score) if avg_score != -math.inf else -math.inf)
+                            all_boltz_scores.append(float(avg_score) if avg_score != -math.inf and avg_score is not None else -math.inf)
                     
                     # Clear GPU memory after each batch
                     if torch.cuda.is_available():
@@ -908,6 +936,16 @@ async def stage2_boltz_scorer(
             if not all_names:
                 continue
             
+            # Ensure all arrays have the same length before creating DataFrame
+            min_length = min(len(all_names), len(all_smiles), len(all_boltz_scores))
+            if min_length == 0:
+                continue
+            
+            # Truncate all arrays to the same length (should already be equal, but safety check)
+            all_names = all_names[:min_length]
+            all_smiles = all_smiles[:min_length]
+            all_boltz_scores = all_boltz_scores[:min_length]
+            
             # Create DataFrame with Boltz-2 scores
             boltz_df = pd.DataFrame({
                 'product_name': all_names,
@@ -921,7 +959,7 @@ async def stage2_boltz_scorer(
             updated_pool = pd.concat([current_pool, boltz_df])
             updated_pool = updated_pool.drop_duplicates(subset=["product_name"], keep="first")
             updated_pool = updated_pool.sort_values(by="boltz_score", ascending=False)
-            BOLTZ_TOP_POOL_SIZE = 100  # Final top pool based on Boltz-2 scores
+            BOLTZ_TOP_POOL_SIZE = 50  # Final top pool based on Boltz-2 scores
             updated_pool = updated_pool.head(BOLTZ_TOP_POOL_SIZE)
             state['boltz_top_pool'] = updated_pool  # Update shared pool
             
@@ -950,17 +988,17 @@ async def stage2_boltz_scorer(
 @profile
 async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
     """
-    Two-stage scoring pipeline:
-    - Stage 1 (PSICHIC on GPU 0): Pre-screen large batches (10K-200K molecules)
-    - Stage 2 (Boltz-2 on GPU 1): Score top candidates (500-2000) for final ranking
+    Optimized single-stage scoring pipeline (PSICHIC skipped):
+    - Generate molecules combinatorially
+    - Randomly sample 500 molecules
+    - Directly score with Boltz-2 (optimized: 50 steps, 1 recycling)
     
     Args:
         state (dict): A shared state dict containing references to:
-            'psichic_models', 'current_challenge_targets', 'current_challenge_antitargets',
-            'psichic_result_column_name', 'best_score', 'candidate_product',
-            'last_submitted_product', 'shutdown_event', etc.
+            'best_score', 'candidate_product', 'last_submitted_product', 
+            'shutdown_event', etc.
     """
-    bt.logging.info("Starting two-stage scoring pipeline: PSICHIC (GPU 0) -> Boltz-2 (GPU 1)")
+    bt.logging.info("Starting optimized single-stage pipeline: Direct Boltz-2 scoring (PSICHIC skipped)")
     setup_gpu_devices()
     
     # Only reactions 4 and 5 are allowed - generate molecules for both
@@ -973,23 +1011,38 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
         state['shutdown_event'].set()
         return
     
-    # Initialize Boltz-2 wrapper (reused across iterations)
-    # Pass device_id=1 to use GPU 1 (PyTorch Lightning will handle device assignment)
-    # Note: CUDA_VISIBLE_DEVICES="0,1" must be set before running (both GPUs visible)
-    bt.logging.info("Initializing Boltz-2 wrapper for GPU 1...")
-    boltz_wrapper = BoltzWrapper(device_id=1)  # Use GPU 1 for Boltz-2
-    state['boltz_wrapper'] = boltz_wrapper
-    bt.logging.info("Boltz-2 wrapper initialized (will use GPU 1 via PyTorch Lightning devices=[1])")
+    # Initialize Boltz-2 wrappers for both GPUs (PSICHIC no longer uses GPU 0)
+    # Check available GPUs
+    if not torch.cuda.is_available():
+        bt.logging.error("CUDA not available. Cannot use dual-GPU setup.")
+        state['shutdown_event'].set()
+        return
     
-    # Create thread pool executor for running Boltz-2 (blocking calls) without blocking async loop
-    # This allows PSICHIC to continue processing while Boltz-2 runs concurrently on GPU 1
-    state['boltz_executor'] = ThreadPoolExecutor(max_workers=1, thread_name_prefix="boltz-scorer")
-    bt.logging.info("Boltz-2 thread pool executor created for concurrent processing")
+    gpu_count = torch.cuda.device_count()
+    if gpu_count < 2:
+        bt.logging.warning(f"Only {gpu_count} GPU(s) available. Using single GPU setup.")
+        device_ids = [0]
+    else:
+        device_ids = [0, 1]  # Use both GPUs for Boltz-2 scoring
+        bt.logging.info(f"Initializing dual-GPU Boltz-2 setup: GPU 0 and GPU 1")
+    
+    # Initialize wrappers for each GPU
+    boltz_wrappers = {}
+    for device_id in device_ids:
+        bt.logging.info(f"Initializing Boltz-2 wrapper for GPU {device_id}...")
+        boltz_wrappers[device_id] = BoltzWrapper(device_id=device_id)
+        bt.logging.info(f"Boltz-2 wrapper for GPU {device_id} initialized (optimized: 50 steps, 1 recycling)")
+    
+    state['boltz_wrappers'] = boltz_wrappers
+    state['gpu_count'] = len(device_ids)
+    
+    # Create thread pool executor for running Boltz-2 (one per GPU for parallel processing)
+    state['boltz_executor'] = ThreadPoolExecutor(max_workers=len(device_ids), thread_name_prefix="boltz-scorer")
+    bt.logging.info(f"Boltz-2 thread pool executor created with {len(device_ids)} workers for parallel GPU processing")
     
     # Initialize evolutionary strategy state
-    # Use Boltz-2 top pool for genetic algorithm (since Boltz-2 is the final scorer)
     boltz_top_pool = pd.DataFrame(columns=["product_name", "smiles", "boltz_score"])
-    state['boltz_top_pool'] = boltz_top_pool  # Share via state for updates
+    state['boltz_top_pool'] = boltz_top_pool
     seen_inchikeys = set()
     iteration = 0
     mutation_prob = 0.1
@@ -997,34 +1050,24 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
     prev_avg_score = None
     score_improvement_rate = 0.0
     
-    # Two-stage pipeline hyperparameters
-    # Stage 1: Generate and pre-screen with PSICHIC
-    # Generate 10K-50K molecules per iteration for PSICHIC pre-filtering (adjustable based on GPU capacity)
-    n_samples_per_reaction = 25  # 10K per reaction = 20K total for PSICHIC pre-filtering (optimized for 2x RTX 3090)
-    
-    # Queue for communication between stages
-    psichic_queue = asyncio.Queue(maxsize=10)  # Queue for passing candidates to Boltz-2
-    
-    # Start Stage 2 (Boltz-2 scorer) as background task
-    boltz_task = asyncio.create_task(
-        stage2_boltz_scorer(state, psichic_queue, boltz_wrapper)
-    )
-    state['boltz_task'] = boltz_task  # Store in state for cleanup
-    bt.logging.info("Stage 2 (Boltz-2) scorer task started on GPU 1")
+    # Optimized pipeline: Each GPU samples 100 molecules independently
+    # Generate enough molecules for all GPUs to sample from
+    MOLECULES_PER_GPU = 100  # Each GPU samples 100 molecules per iteration
+    n_samples_per_reaction = 150  # Generate enough for both GPUs (150 per reaction = 300 total, allows sampling)
 
     while not state['shutdown_event'].is_set():
         try:
             iteration += 1
-            bt.logging.debug(f"Two-stage pipeline iteration {iteration}")
+            bt.logging.info(f"Optimized pipeline iteration {iteration}")
             
-            # Get current Boltz-2 top pool from state (updated by stage2_boltz_scorer)
+            # Get current Boltz-2 top pool from state
             current_boltz_pool = state.get('boltz_top_pool', pd.DataFrame(columns=["product_name", "smiles", "boltz_score"]))
             
-            # Build component weights for each reaction from Boltz-2 top pool (final scorer)
+            # Build component weights for each reaction from Boltz-2 top pool
             component_weights_rxn4 = build_component_weights(current_boltz_pool, 4) if not current_boltz_pool.empty else None
             component_weights_rxn5 = build_component_weights(current_boltz_pool, 5) if not current_boltz_pool.empty else None
             
-            # Select diverse elites from Boltz-2 top pool (final scorer)
+            # Select diverse elites from Boltz-2 top pool
             n_elites = min(50, len(current_boltz_pool))  # Use up to 50 elites from top pool
             elite_df = select_diverse_elites(current_boltz_pool, n_elites) if not current_boltz_pool.empty else pd.DataFrame()
             if not elite_df.empty:
@@ -1034,7 +1077,7 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
                 elite_names_rxn4 = None
                 elite_names_rxn5 = None
             
-            # Adaptive sampling: adjust based on Boltz-2 score improvement (final scorer)
+            # Adaptive sampling: adjust based on Boltz-2 score improvement
             if prev_avg_score is not None and not current_boltz_pool.empty:
                 current_avg = current_boltz_pool['boltz_score'].mean()
                 score_improvement_rate = (current_avg - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
@@ -1047,22 +1090,297 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
                     elite_frac = max(0.2, elite_frac * 0.9)
                     mutation_prob = min(0.4, mutation_prob * 1.1)
             
-            # Stage 1: Generate and pre-screen with PSICHIC
+            # Generate molecules combinatorially (CPU-intensive - run in executor)
+            loop = asyncio.get_event_loop()
+            executor = state.get('molecule_gen_executor', None)
+            if executor is None:
+                executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="molecule-gen")
+                state['molecule_gen_executor'] = executor
+            
             elite_names_dict = {4: elite_names_rxn4, 5: elite_names_rxn5} if elite_names_rxn4 or elite_names_rxn5 else None
             component_weights_dict = {4: component_weights_rxn4, 5: component_weights_rxn5} if component_weights_rxn4 or component_weights_rxn5 else None
             
-            await stage1_psichic_prefilter(
-                state=state,
-                psichic_queue=psichic_queue,
-                db_path=db_path,
-                n_samples_per_reaction=n_samples_per_reaction,
-                elite_names_dict=elite_names_dict,
-                component_weights_dict=component_weights_dict,
-                elite_frac=elite_frac,
-                mutation_prob=mutation_prob,
-                seen_inchikeys=seen_inchikeys,
-                iteration=iteration
+            sampler_data = await loop.run_in_executor(
+                executor,
+                generate_valid_molecules_batch,
+                [4, 5],
+                n_samples_per_reaction,
+                db_path,
+                state['config'],
+                400,  # batch_size
+                elite_names_dict,
+                elite_frac,
+                mutation_prob,
+                seen_inchikeys,
+                component_weights_dict
             )
+            
+            # Yield control after CPU-intensive generation
+            await asyncio.sleep(0.01)
+            
+            if not sampler_data or not sampler_data.get("molecules"):
+                bt.logging.warning(f"Iteration {iteration}: No molecules generated, skipping")
+                await asyncio.sleep(2)
+                continue
+            
+            generated_names = sampler_data["molecules"]
+            generated_smiles = sampler_data["smiles"]
+            
+            # Count molecules per reaction for logging
+            rxn4_count = sum(1 for name in generated_names if name.startswith("rxn:4:"))
+            rxn5_count = sum(1 for name in generated_names if name.startswith("rxn:5:"))
+            bt.logging.info(f"Iteration {iteration}: Generated {len(generated_names)} molecules (rxn4: {rxn4_count}, rxn5: {rxn5_count})")
+            
+            # Each GPU independently samples 100 molecules and applies pre-filtering
+            MINER_UID = 0
+            # Adaptive batch size: start with 50, reduce on OOM errors
+            BOLTZ_BATCH_SIZE = state.get('boltz_batch_size', 50)  # Start with 50, adaptively reduce on OOM
+            MIN_BATCH_SIZE = 10  # Minimum batch size to avoid too many small batches
+            gpu_count = state.get('gpu_count', 1)
+            boltz_wrappers = state.get('boltz_wrappers', {0: state.get('boltz_wrapper')})
+            
+            # Get prefilter config
+            rot_min = state['config'].min_rotatable_bonds
+            rot_max = state['config'].max_rotatable_bonds
+            heavy_min = state['config'].min_heavy_atoms
+            mw_max = getattr(state['config'], 'prefilter_mw_max', 550.0)
+            tpsa_max = getattr(state['config'], 'prefilter_tpsa_max', 140.0)
+            
+            all_boltz_scores = []
+            all_names = []
+            all_smiles = []
+            
+            # Process each GPU independently: sample -> pre-filter -> score
+            async def process_gpu_pipeline(gpu_id: int) -> tuple[list, list, list]:
+                """
+                Each GPU independently:
+                1. Samples 100 molecules from generated pool
+                2. Applies ultra-light pre-filtering
+                3. Scores pre-filtered molecules with Boltz-2
+                """
+                import random
+                wrapper = boltz_wrappers[gpu_id]
+                gpu_results_names = []
+                gpu_results_smiles = []
+                gpu_results_scores = []
+                
+                # Step 1: Sample 100 molecules for this GPU
+                if len(generated_names) > MOLECULES_PER_GPU:
+                    # Each GPU gets a different random sample
+                    random.seed(iteration * 1000 + gpu_id)  # Different seed per GPU per iteration
+                    indices = random.sample(range(len(generated_names)), MOLECULES_PER_GPU)
+                    sampled_names = [generated_names[i] for i in indices]
+                    sampled_smiles = [generated_smiles[i] for i in indices]
+                else:
+                    # If not enough molecules, split what we have
+                    start_idx = gpu_id * MOLECULES_PER_GPU
+                    end_idx = min(start_idx + MOLECULES_PER_GPU, len(generated_names))
+                    sampled_names = generated_names[start_idx:end_idx]
+                    sampled_smiles = generated_smiles[start_idx:end_idx]
+                
+                bt.logging.info(f"GPU {gpu_id}: Sampled {len(sampled_names)} molecules")
+                
+                # Step 2: Apply ultra-light pre-filtering on this GPU's sample
+                prefiltered_names = []
+                prefiltered_smiles = []
+                rejection_counts = {}
+                
+                for name, smiles in zip(sampled_names, sampled_smiles):
+                    ok, reason = ultra_light_prefilter(smiles, rot_min, rot_max, heavy_min, mw_max, tpsa_max)
+                    if ok:
+                        prefiltered_names.append(name)
+                        prefiltered_smiles.append(smiles)
+                    else:
+                        if reason:
+                            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                
+                bt.logging.info(f"GPU {gpu_id}: Pre-filtered {len(sampled_names)} -> {len(prefiltered_smiles)} molecules (rejected {len(sampled_names) - len(prefiltered_smiles)})")
+                if rejection_counts:
+                    top_reasons = sorted(rejection_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+                    bt.logging.debug(f"GPU {gpu_id} top rejection reasons: {dict(top_reasons)}")
+                
+                if not prefiltered_smiles:
+                    bt.logging.warning(f"GPU {gpu_id}: No molecules passed pre-filtering")
+                    return gpu_results_names, gpu_results_smiles, gpu_results_scores
+                
+                # Step 3: Score pre-filtered molecules with Boltz-2
+                # Check GPU memory before processing
+                if torch.cuda.is_available():
+                    try:
+                        device = torch.device(f"cuda:{gpu_id}")
+                        total_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)  # GB
+                        cached_vram_gb = torch.cuda.memory_reserved(device) / (1024**3)  # GB
+                        vram_usage = cached_vram_gb / total_vram_gb if total_vram_gb > 0 else 0
+                        
+                        if vram_usage > 0.85:  # If VRAM usage > 85%, reduce batch size
+                            current_batch_size = max(MIN_BATCH_SIZE, int(BOLTZ_BATCH_SIZE * 0.7))
+                            bt.logging.warning(f"High GPU {gpu_id} memory usage ({vram_usage:.1%}), using batch size {current_batch_size}")
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                    except Exception as e:
+                        bt.logging.warning(f"Could not check GPU {gpu_id} memory: {e}")
+                
+                # Process in sub-batches to avoid OOM
+                for batch_start in range(0, len(prefiltered_smiles), BOLTZ_BATCH_SIZE):
+                    batch_end = min(batch_start + BOLTZ_BATCH_SIZE, len(prefiltered_smiles))
+                    sub_batch_names = prefiltered_names[batch_start:batch_end]
+                    sub_batch_smiles = prefiltered_smiles[batch_start:batch_end]
+                
+                    # Create valid_molecules_by_uid format for Boltz-2
+                    valid_molecules_for_boltz = {
+                        MINER_UID: {
+                            'smiles': sub_batch_smiles,
+                            'names': sub_batch_names
+                        }
+                    }
+                    
+                    # Create score_dict structure
+                    score_dict_boltz = {
+                        MINER_UID: {
+                            'boltz_score': None,
+                            'entropy_boltz': None
+                        }
+                    }
+                    
+                    # Score with Boltz-2
+                    try:
+                        final_block_hash = "0x" + hashlib.sha256(str(iteration).encode()).hexdigest()[:64]
+                        
+                        config_obj = state['config']
+                        boltz_config = {
+                            'weekly_target': getattr(config_obj, 'weekly_target', None),
+                            'num_antitargets': getattr(config_obj, 'num_antitargets', 1),
+                            'binding_pocket': getattr(config_obj, 'binding_pocket', None),
+                            'max_distance': getattr(config_obj, 'max_distance', None),
+                            'force': getattr(config_obj, 'force', False),
+                            'num_molecules_boltz': len(sub_batch_smiles),
+                            'boltz_metric': getattr(config_obj, 'boltz_metric', 'affinity_probability_binary'),
+                            'sample_selection': 'first',
+                        }
+                        
+                        # Run blocking Boltz-2 call in executor (non-blocking for async loop)
+                        await loop.run_in_executor(
+                            state['boltz_executor'],
+                            wrapper.score_molecules_target,
+                            valid_molecules_for_boltz,
+                            score_dict_boltz,
+                            boltz_config,
+                            final_block_hash
+                        )
+                        
+                        # Get per-molecule Boltz scores from wrapper
+                        per_molecule_scores = wrapper.per_molecule_metric.get(MINER_UID, {})
+                        
+                        # Store results
+                        for name, smiles in zip(sub_batch_names, sub_batch_smiles):
+                            gpu_results_names.append(name)
+                            gpu_results_smiles.append(smiles)
+                            if smiles in per_molecule_scores:
+                                score = per_molecule_scores[smiles]
+                                if score is not None:
+                                    gpu_results_scores.append(float(score))
+                                else:
+                                    avg_score = score_dict_boltz[MINER_UID].get('boltz_score', -math.inf)
+                                    gpu_results_scores.append(float(avg_score) if avg_score != -math.inf and avg_score is not None else -math.inf)
+                            else:
+                                avg_score = score_dict_boltz[MINER_UID].get('boltz_score', -math.inf)
+                                gpu_results_scores.append(float(avg_score) if avg_score != -math.inf and avg_score is not None else -math.inf)
+                        
+                        # Clear GPU memory after each batch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        
+                        bt.logging.debug(f"GPU {gpu_id}: Scored {len(sub_batch_smiles)} molecules in sub-batch")
+                        
+                    except RuntimeError as e:
+                        error_msg = str(e).lower()
+                        # Check for OOM errors
+                        if 'out of memory' in error_msg or 'cuda' in error_msg:
+                            bt.logging.error(f"GPU {gpu_id} OOM error: {e}")
+                            # Clear GPU memory aggressively
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                            gc.collect()
+                            
+                            # Assign -inf scores for failed batch
+                            for name, smiles in zip(sub_batch_names, sub_batch_smiles):
+                                gpu_results_names.append(name)
+                                gpu_results_smiles.append(smiles)
+                                gpu_results_scores.append(-math.inf)
+                        else:
+                            bt.logging.error(f"RuntimeError on GPU {gpu_id}: {e}")
+                            traceback.print_exc()
+                            # Assign -inf scores for failed batch
+                            for name, smiles in zip(sub_batch_names, sub_batch_smiles):
+                                gpu_results_names.append(name)
+                                gpu_results_smiles.append(smiles)
+                                gpu_results_scores.append(-math.inf)
+                        
+                    except Exception as e:
+                        bt.logging.error(f"Error on GPU {gpu_id} scoring batch: {e}")
+                        traceback.print_exc()
+                        # Assign -inf scores for failed batch
+                        for name, smiles in zip(sub_batch_names, sub_batch_smiles):
+                            gpu_results_names.append(name)
+                            gpu_results_smiles.append(smiles)
+                            gpu_results_scores.append(-math.inf)
+                
+                return gpu_results_names, gpu_results_smiles, gpu_results_scores
+            
+            # Process all GPUs in parallel (each GPU samples 100, pre-filters, and scores independently)
+            tasks = []
+            for gpu_id in boltz_wrappers.keys():
+                task = process_gpu_pipeline(gpu_id)
+                tasks.append(task)
+            
+            # Wait for all GPUs to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Merge results from all GPUs into shared top_pool
+            for result in results:
+                if isinstance(result, Exception):
+                    bt.logging.error(f"Error in GPU pipeline task: {result}")
+                    continue
+                gpu_names, gpu_smiles, gpu_scores = result
+                all_names.extend(gpu_names)
+                all_smiles.extend(gpu_smiles)
+                all_boltz_scores.extend(gpu_scores)
+            
+            if not all_names:
+                bt.logging.warning(f"Iteration {iteration}: No molecules scored, skipping pool update")
+                await asyncio.sleep(2)
+                continue
+            
+            # Create DataFrame with Boltz-2 scores
+            boltz_df = pd.DataFrame({
+                'product_name': all_names,
+                'smiles': all_smiles,
+                'boltz_score': all_boltz_scores
+            })
+            
+            # Update Boltz-2 top pool
+            current_pool = state.get('boltz_top_pool', pd.DataFrame(columns=["product_name", "smiles", "boltz_score"]))
+            updated_pool = pd.concat([current_pool, boltz_df])
+            updated_pool = updated_pool.drop_duplicates(subset=["product_name"], keep="first")
+            updated_pool = updated_pool.sort_values(by="boltz_score", ascending=False)
+            BOLTZ_TOP_POOL_SIZE = 50  # Maintain top 50 pool size
+            updated_pool = updated_pool.head(BOLTZ_TOP_POOL_SIZE)
+            state['boltz_top_pool'] = updated_pool
+            
+            # Update best candidate based on Boltz-2 score
+            if not updated_pool.empty:
+                top_molecule = updated_pool.iloc[0]
+                final_score = top_molecule['boltz_score']
+                
+                if final_score > state['best_score']:
+                    state['best_score'] = final_score
+                    candidate_name = top_molecule['product_name']
+                    state['candidate_product'] = candidate_name
+                    reaction_type = candidate_name.split(":")[1] if ":" in candidate_name else "unknown"
+                    bt.logging.info(f"New best Boltz-2 score: {final_score:.4f}, Candidate: {candidate_name}, Reaction: {reaction_type}")
+                    bt.logging.info(f"Boltz-2 top pool stats - Avg: {updated_pool['boltz_score'].mean():.4f}, Max: {updated_pool['boltz_score'].max():.4f}")
             
             # Yield control to event loop to prevent CPU spinning
             await asyncio.sleep(0.1)
@@ -1075,9 +1393,9 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
                 # Clear LRU cache periodically to free memory
                 get_molecules_by_role.cache_clear()
             
-            # Update seen InChIKeys from Boltz-2 top pool (final scorer)
-            if not current_boltz_pool.empty:
-                for smile in current_boltz_pool['smiles'].tolist():
+            # Update seen InChIKeys from Boltz-2 top pool
+            if not updated_pool.empty:
+                for smile in updated_pool['smiles'].tolist():
                     try:
                         mol = Chem.MolFromSmiles(smile)
                         if mol:
@@ -1086,15 +1404,15 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
                     except Exception:
                         pass
             
-            # Track Boltz-2 score improvement (final scorer)
-            current_avg_score = current_boltz_pool['boltz_score'].mean() if not current_boltz_pool.empty else None
+            # Track Boltz-2 score improvement
+            current_avg_score = updated_pool['boltz_score'].mean() if not updated_pool.empty else None
             if current_avg_score is not None:
                 if prev_avg_score is not None:
                     score_improvement_rate = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
                 prev_avg_score = current_avg_score
                 
-                if not current_boltz_pool.empty:
-                    bt.logging.info(f"Boltz-2 top pool - Avg: {current_boltz_pool['boltz_score'].mean():.4f}, Max: {current_boltz_pool['boltz_score'].max():.4f}, Size: {len(current_boltz_pool)}, Improvement: {score_improvement_rate*100:.2f}%")
+                if not updated_pool.empty:
+                    bt.logging.info(f"Boltz-2 top pool - Avg: {updated_pool['boltz_score'].mean():.4f}, Max: {updated_pool['boltz_score'].max():.4f}, Size: {len(updated_pool)}, Improvement: {score_improvement_rate*100:.2f}%")
             
             # Check for submission (based on Boltz-2 scores in state)
             current_block = await state['subtensor'].get_current_block()
@@ -1117,18 +1435,9 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
             await asyncio.sleep(2)
 
         except Exception as e:
-            bt.logging.error(f"Error in two-stage pipeline: {e}")
+            bt.logging.error(f"Error in optimized pipeline: {e}")
             traceback.print_exc()
             state['shutdown_event'].set()
-    
-    # Cleanup: Cancel Boltz-2 task and clean up resources
-    if 'boltz_task' in state and state['boltz_task']:
-        if not state['boltz_task'].done():
-            state['boltz_task'].cancel()
-            try:
-                await state['boltz_task']
-            except asyncio.CancelledError:
-                pass
     
     # Shutdown thread pool executors
     if 'boltz_executor' in state and state.get('boltz_executor'):
@@ -1139,7 +1448,15 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
         state['molecule_gen_executor'].shutdown(wait=True)
         bt.logging.info("Molecule generation thread pool executor shut down")
     
-    if 'boltz_wrapper' in state and state['boltz_wrapper']:
+    # Cleanup all Boltz wrappers
+    if 'boltz_wrappers' in state and state['boltz_wrappers']:
+        for gpu_id, wrapper in state['boltz_wrappers'].items():
+            try:
+                wrapper.cleanup_model()
+            except Exception:
+                pass
+    # Fallback for old single-wrapper setup
+    elif 'boltz_wrapper' in state and state['boltz_wrapper']:
         try:
             state['boltz_wrapper'].cleanup_model()
         except Exception:

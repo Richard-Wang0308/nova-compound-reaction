@@ -9,6 +9,7 @@ import gc
 import shutil
 import hashlib
 import math
+import psutil
 from pathlib import Path
 
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
@@ -110,6 +111,11 @@ class BoltzWrapper:
         self.structure_model = None
         self.affinity_model = None
         self._models_loaded = False
+        
+        # Memory monitoring settings
+        self.enable_memory_monitoring = self.config.get('enable_memory_monitoring', True)
+        self.max_gpu_memory_usage = self.config.get('max_gpu_memory_usage', 0.90)
+        self.max_ram_usage = self.config.get('max_ram_usage', 0.85)
 
     @profile
     def preprocess_data_for_boltz(self, valid_molecules_by_uid: dict, score_dict: dict, final_block_hash: str) -> None:
@@ -353,8 +359,23 @@ properties:
             # With batch_size=1 (mandatory), we MUST process many molecules in parallel via workers
             # DataLoader does expensive work: file I/O, RDKit parsing, tokenization, structure prep
             # Default num_workers=2 causes GPU to be idle 99% of the time
-            # RTX 3090: 16-24 workers recommended (aggressive parallelization)
-            num_workers = self.config.get('num_workers', 24)  # Use 24 workers for RTX 3090
+            # Optimized for 56-core Intel Xeon: 32 workers recommended (configurable via boltz_config.yaml)
+            base_num_workers = self.config.get('num_workers', 32)  # Safe default for 56-core system
+            
+            # Adaptive worker adjustment based on available memory
+            if self.enable_memory_monitoring:
+                num_workers = self._adjust_workers_for_memory(base_num_workers)
+            else:
+                num_workers = base_num_workers
+            
+            # Check GPU memory before processing
+            if torch.cuda.is_available() and self.enable_memory_monitoring:
+                gpu_memory_usage = self._check_gpu_memory()
+                if gpu_memory_usage > self.max_gpu_memory_usage:
+                    bt.logging.warning(f"GPU memory usage high ({gpu_memory_usage:.1%}), consider reducing batch size or workers")
+                    # Clear cache before processing
+                    torch.cuda.empty_cache()
+                    gc.collect()
             
             predict(
                 data = self.input_dir,
@@ -409,8 +430,15 @@ properties:
 
         if self.config['remove_files']:
             bt.logging.info("Removing files")
-            os.system(f"rm -r {os.path.join(self.output_dir, 'boltz_results_inputs')}")
-            os.system(f"rm {self.input_dir}/*.yaml")
+            # Optimized: Use shutil and pathlib instead of os.system for better performance
+            results_dir = Path(self.output_dir) / 'boltz_results_inputs'
+            if results_dir.exists():
+                shutil.rmtree(results_dir)  # Faster than os.system("rm -r")
+            
+            # Remove YAML files more efficiently
+            yaml_files = list(Path(self.input_dir).glob("*.yaml"))
+            for yaml_file in yaml_files:
+                yaml_file.unlink()  # Faster than os.system("rm")
             bt.logging.info("Files removed")
 
         # Distribute results to all UIDs
@@ -434,6 +462,88 @@ properties:
                 data['boltz_score'] = np.mean(final_boltz_scores[uid])
             else:
                 data['boltz_score'] = -math.inf
+    
+    def _check_gpu_memory(self) -> float:
+        """
+        Check current GPU memory usage as a fraction of total VRAM.
+        
+        Returns:
+            float: GPU memory usage as a fraction (0.0 to 1.0)
+        """
+        if not torch.cuda.is_available():
+            return 0.0
+        
+        try:
+            device = torch.device(f"cuda:{self.device_id}")
+            total_memory = torch.cuda.get_device_properties(device).total_memory
+            allocated_memory = torch.cuda.memory_allocated(device)
+            cached_memory = torch.cuda.memory_reserved(device)
+            
+            # Use cached memory as it's more accurate for peak usage
+            usage = cached_memory / total_memory if total_memory > 0 else 0.0
+            return usage
+        except Exception as e:
+            bt.logging.warning(f"Error checking GPU memory: {e}")
+            return 0.0
+    
+    def _check_ram_usage(self) -> float:
+        """
+        Check current system RAM usage as a fraction of total RAM.
+        
+        Returns:
+            float: RAM usage as a fraction (0.0 to 1.0)
+        """
+        try:
+            memory = psutil.virtual_memory()
+            return memory.percent / 100.0
+        except Exception as e:
+            bt.logging.warning(f"Error checking RAM usage: {e}")
+            return 0.0
+    
+    def _adjust_workers_for_memory(self, base_workers: int) -> int:
+        """
+        Adjust number of workers based on available RAM to prevent OOM.
+        
+        Args:
+            base_workers: Base number of workers from config
+            
+        Returns:
+            int: Adjusted number of workers (reduced if RAM is high)
+        """
+        try:
+            ram_usage = self._check_ram_usage()
+            
+            # Each DataLoader worker uses ~50-100MB RAM
+            # Estimate: base_workers * 75MB average
+            estimated_worker_memory_mb = base_workers * 75
+            memory = psutil.virtual_memory()
+            available_memory_mb = memory.available / (1024 * 1024)
+            
+            # If RAM usage is above threshold, reduce workers
+            if ram_usage > self.max_ram_usage:
+                # Reduce workers proportionally
+                reduction_factor = (1.0 - ram_usage) / (1.0 - self.max_ram_usage)
+                adjusted_workers = max(4, int(base_workers * reduction_factor))
+                bt.logging.warning(
+                    f"RAM usage high ({ram_usage:.1%}), reducing workers from {base_workers} to {adjusted_workers}"
+                )
+                return adjusted_workers
+            
+            # If we don't have enough available memory for workers, reduce
+            if available_memory_mb < estimated_worker_memory_mb * 1.5:  # 1.5x safety margin
+                max_safe_workers = int(available_memory_mb / (75 * 1.5))
+                adjusted_workers = max(4, min(base_workers, max_safe_workers))
+                if adjusted_workers < base_workers:
+                    bt.logging.warning(
+                        f"Limited RAM available ({available_memory_mb:.0f}MB), reducing workers from {base_workers} to {adjusted_workers}"
+                    )
+                return adjusted_workers
+            
+            return base_workers
+            
+        except Exception as e:
+            bt.logging.warning(f"Error adjusting workers for memory: {e}, using base workers")
+            return base_workers
     
     def clear_gpu_memory(self):
         """Clear GPU memory and run garbage collection."""

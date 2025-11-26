@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 import time
 from rdkit import Chem
-from rdkit.Chem import MACCSkeys, AllChem
+from rdkit.Chem import MACCSkeys, AllChem, Descriptors
+from rdkit.Chem import rdMolDescriptors
 from huggingface_hub import hf_hub_download, hf_hub_url, get_hf_file_metadata
 from huggingface_hub.errors import EntryNotFoundError
 import bittensor as bt
@@ -84,6 +85,51 @@ def get_heavy_atom_count(smiles: str) -> int:
         i += 1
     
     return count
+
+
+def ultra_light_prefilter(smiles: str,
+                          rot_min: int, rot_max: int,
+                          heavy_min: int,
+                          mw_max: float = 550.0,
+                          tpsa_max: float = 140.0) -> tuple[bool, str | None]:
+    """
+    Ultra-light prefilter using cheap RDKit properties only.
+    
+    Returns (True, None) when pass. Otherwise (False, reason_str).
+    Very cheap RDKit properties only - computed in microseconds.
+    
+    Args:
+        smiles: SMILES string to validate
+        rot_min: Minimum number of rotatable bonds
+        rot_max: Maximum number of rotatable bonds
+        heavy_min: Minimum number of heavy atoms
+        mw_max: Maximum molecular weight (default: 550.0)
+        tpsa_max: Maximum topological polar surface area (default: 140.0)
+    
+    Returns:
+        tuple: (is_valid, reason) where is_valid is bool and reason is str or None
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return False, "invalid_smiles"
+    
+    heavy = mol.GetNumHeavyAtoms()
+    if heavy < heavy_min:
+        return False, f"heavy_lt_{heavy_min}:{heavy}"
+    
+    rot = rdMolDescriptors.CalcNumRotatableBonds(mol)
+    if rot < rot_min or rot > rot_max:
+        return False, f"rot_range:{rot}"
+    
+    mw = Descriptors.MolWt(mol)
+    if mw > mw_max:
+        return False, f"mw_gt_{mw_max}:{mw:.1f}"
+    
+    tpsa = rdMolDescriptors.CalcTPSA(mol)
+    if tpsa > tpsa_max:
+        return False, f"tpsa_gt_{tpsa_max}:{tpsa:.1f}"
+    
+    return True, None
 
 
 def compute_maccs_entropy(smiles_list: list[str]) -> float:

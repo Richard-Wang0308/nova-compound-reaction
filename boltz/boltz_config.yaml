@@ -1,8 +1,8 @@
 # Boltz configuration
 seed: 68
-recycling_steps: 3
+recycling_steps: 1  # Optimized: reduced from 3 to 1 for faster inference
 diffusion_samples: 1
-sampling_steps: 100
+sampling_steps: 50  # Optimized: reduced from 100 to 50 for faster inference
 sampling_steps_affinity: 100
 diffusion_samples_affinity: 3
 affinity_mw_correction: true
@@ -16,16 +16,24 @@ batch_predictions: true
 # DataLoader optimization - CRITICAL for performance
 # With batch_size=1 (mandatory for structure prediction), we MUST process many molecules in parallel via workers
 # This prevents GPU from being idle 99% of the time waiting for DataLoader
-# Recommended: 8-12 for RTX 3090 (balance between speed, memory, and CPU usage)
-# Each worker handles file I/O, RDKit parsing, tokenization in parallel (CPU-intensive)
-# WARNING: Too many workers can cause OOM or CPU overload - reduce if process gets killed or CPU spikes
-num_workers: 8
+# Optimized for 56-core Intel Xeon E5-2680 v4: Use 32 workers (safer than 40 to avoid RAM/CPU overload)
+# Each worker uses ~50-100MB RAM, so 32 workers = ~1.6-3.2GB RAM for DataLoader
+# With 56 cores (112 logical with HT), 32 workers leaves plenty of headroom for system/GPU processes
+# WARNING: If you see OOM errors or CPU > 90%, reduce to 24-28 workers
+num_workers: 32  # Safe for 56-core system: balances performance with memory safety (max 40 if RAM allows)
 
 # Precomputed conformers optimization (LARGEST WIN - saves CPU time)
 # Precompute conformers in parallel before inference to skip expensive RDKit embedding
+# Each worker uses ~100-200MB RAM for conformer generation
+# 40 workers = ~4-8GB RAM, leaving headroom for DataLoader workers and system
 use_precomputed_conformers: true  # Enable precomputation (recommended)
-precompute_workers: 32  # Number of parallel workers for conformer generation
+precompute_workers: 40  # Safe for 56-core system: balances speed with memory (max 48 if RAM allows)
 precompute_shard_size: 1000  # Number of records per shard file
+
+# Memory safety settings
+max_gpu_memory_usage: 0.90  # Maximum GPU memory usage before reducing batch size (90% of VRAM)
+max_ram_usage: 0.85  # Maximum system RAM usage before reducing workers (85% of RAM)
+enable_memory_monitoring: true  # Enable memory monitoring and adaptive adjustments
 
 # Model quantization (for faster inference)
 # Options: "none", "fp16", "int8"
