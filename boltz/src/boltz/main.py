@@ -780,7 +780,7 @@ def _make_gen(seed: int, device: str = "cuda"):
     g.manual_seed(seed)
     return g
 
-@profile    
+# @profile    
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,

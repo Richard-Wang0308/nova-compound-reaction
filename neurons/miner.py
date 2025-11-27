@@ -7,6 +7,7 @@ import asyncio
 import datetime
 import tempfile
 import traceback
+import shutil
 import base64
 import hashlib
 import sqlite3
@@ -636,7 +637,7 @@ def setup_gpu_devices():
     else:
         bt.logging.error("CUDA not available. Two-stage pipeline requires GPU support.")
 
-@profile  
+# @profile  
 async def stage1_psichic_prefilter(
     state: Dict[str, Any],
     psichic_queue: asyncio.Queue,
@@ -791,7 +792,7 @@ async def stage1_psichic_prefilter(
     
     # No need to maintain PSICHIC top pool - Boltz-2 maintains the final top pool
 
-@profile
+# @profile
 async def stage2_boltz_scorer(
     state: Dict[str, Any],
     psichic_queue: asyncio.Queue,
@@ -985,7 +986,7 @@ async def stage2_boltz_scorer(
     
     return state.get('boltz_top_pool', pd.DataFrame())
 
-@profile
+# @profile
 async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
     """
     Optimized single-stage scoring pipeline (PSICHIC skipped):
@@ -1030,6 +1031,13 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
     boltz_wrappers = {}
     for device_id in device_ids:
         bt.logging.info(f"Initializing Boltz-2 wrapper for GPU {device_id}...")
+        
+        # Clear GPU memory before initializing wrapper to avoid OOM
+        if torch.cuda.is_available():
+            torch.cuda.set_device(device_id)
+            torch.cuda.empty_cache()
+            gc.collect()
+        
         boltz_wrappers[device_id] = BoltzWrapper(device_id=device_id)
         bt.logging.info(f"Boltz-2 wrapper for GPU {device_id} initialized (optimized: 50 steps, 1 recycling)")
     
@@ -1136,6 +1144,7 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
             # Adaptive batch size: start with 50, reduce on OOM errors
             BOLTZ_BATCH_SIZE = state.get('boltz_batch_size', 50)  # Start with 50, adaptively reduce on OOM
             MIN_BATCH_SIZE = 10  # Minimum batch size to avoid too many small batches
+            actual_batch_size = BOLTZ_BATCH_SIZE  # Will be updated by memory check if needed
             gpu_count = state.get('gpu_count', 1)
             boltz_wrappers = state.get('boltz_wrappers', {0: state.get('boltz_wrapper')})
             
@@ -1207,16 +1216,25 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
                 # Check GPU memory before processing
                 if torch.cuda.is_available():
                     try:
+                        torch.cuda.set_device(gpu_id)  # Set device context
                         device = torch.device(f"cuda:{gpu_id}")
                         total_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)  # GB
-                        cached_vram_gb = torch.cuda.memory_reserved(device) / (1024**3)  # GB
-                        vram_usage = cached_vram_gb / total_vram_gb if total_vram_gb > 0 else 0
+                        reserved_vram_gb = torch.cuda.memory_reserved(device) / (1024**3)  # GB
+                        allocated_vram_gb = torch.cuda.memory_allocated(device) / (1024**3)  # GB
+                        free_vram_gb = total_vram_gb - reserved_vram_gb
+                        vram_usage = reserved_vram_gb / total_vram_gb if total_vram_gb > 0 else 0
                         
-                        if vram_usage > 0.85:  # If VRAM usage > 85%, reduce batch size
-                            current_batch_size = max(MIN_BATCH_SIZE, int(BOLTZ_BATCH_SIZE * 0.7))
-                            bt.logging.warning(f"High GPU {gpu_id} memory usage ({vram_usage:.1%}), using batch size {current_batch_size}")
+                        bt.logging.debug(f"GPU {gpu_id} memory: {allocated_vram_gb:.2f}GB allocated, {reserved_vram_gb:.2f}GB reserved, {free_vram_gb:.2f}GB free ({vram_usage:.1%} usage)")
+                        
+                        if vram_usage > 0.85 or free_vram_gb < 2.0:  # If VRAM usage > 85% or < 2GB free, reduce batch size
+                            actual_batch_size = max(MIN_BATCH_SIZE, int(BOLTZ_BATCH_SIZE * 0.7))
+                            bt.logging.warning(f"High GPU {gpu_id} memory usage ({vram_usage:.1%}, {free_vram_gb:.2f}GB free), using reduced batch size {actual_batch_size}")
                             torch.cuda.empty_cache()
                             gc.collect()
+                            # Update state for next iteration
+                            state['boltz_batch_size'] = actual_batch_size
+                        else:
+                            actual_batch_size = BOLTZ_BATCH_SIZE
                     except Exception as e:
                         bt.logging.warning(f"Could not check GPU {gpu_id} memory: {e}")
                 
@@ -1407,12 +1425,26 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
             # Track Boltz-2 score improvement
             current_avg_score = updated_pool['boltz_score'].mean() if not updated_pool.empty else None
             if current_avg_score is not None:
+                # Handle numerical stability: check for inf/nan values
                 if prev_avg_score is not None:
-                    score_improvement_rate = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
+                    if math.isinf(prev_avg_score) or math.isnan(prev_avg_score):
+                        score_improvement_rate = 0.0
+                    elif math.isinf(current_avg_score) or math.isnan(current_avg_score):
+                        score_improvement_rate = 0.0
+                    else:
+                        # Avoid division by zero or near-zero
+                        denominator = max(abs(prev_avg_score), 1e-6)
+                        if denominator > 0:
+                            score_improvement_rate = (current_avg_score - prev_avg_score) / denominator
+                        else:
+                            score_improvement_rate = 0.0
+                else:
+                    score_improvement_rate = 0.0
                 prev_avg_score = current_avg_score
                 
                 if not updated_pool.empty:
-                    bt.logging.info(f"Boltz-2 top pool - Avg: {updated_pool['boltz_score'].mean():.4f}, Max: {updated_pool['boltz_score'].max():.4f}, Size: {len(updated_pool)}, Improvement: {score_improvement_rate*100:.2f}%")
+                    improvement_str = f"{score_improvement_rate*100:.2f}%" if not (math.isnan(score_improvement_rate) or math.isinf(score_improvement_rate)) else "N/A"
+                    bt.logging.info(f"Boltz-2 top pool - Avg: {updated_pool['boltz_score'].mean():.4f}, Max: {updated_pool['boltz_score'].max():.4f}, Size: {len(updated_pool)}, Improvement: {improvement_str}")
             
             # Check for submission (based on Boltz-2 scores in state)
             current_block = await state['subtensor'].get_current_block()
@@ -1461,6 +1493,17 @@ async def run_two_stage_pipeline(state: Dict[str, Any]) -> None:
             state['boltz_wrapper'].cleanup_model()
         except Exception:
             pass
+    
+    # Cleanup boltz_tmp_files directory
+    try:
+        # boltz_tmp_files is created at PARENT_DIR/boltz_tmp_files where PARENT_DIR is one level up from boltz
+        # BASE_DIR in miner.py is nova/ directory, so boltz_tmp_files should be at nova/boltz_tmp_files
+        boltz_tmp_dir = os.path.join(BASE_DIR, "boltz_tmp_files")
+        if os.path.exists(boltz_tmp_dir):
+            shutil.rmtree(boltz_tmp_dir)
+            bt.logging.info(f"Cleaned up boltz_tmp_files directory: {boltz_tmp_dir}")
+    except Exception as e:
+        bt.logging.warning(f"Failed to cleanup boltz_tmp_files directory: {e}")
 
 
 async def submit_response(state: Dict[str, Any]) -> None:
@@ -1538,7 +1581,7 @@ async def submit_response(state: Dict[str, Any]) -> None:
 # ----------------------------------------------------------------------------
 # 6. MAIN MINING LOOP
 # ----------------------------------------------------------------------------
-@profile
+# @profile
 async def run_miner(config: argparse.Namespace) -> None:
     """
     The main mining loop, orchestrating:
@@ -1806,6 +1849,19 @@ async def run_miner(config: argparse.Namespace) -> None:
         except KeyboardInterrupt:
             bt.logging.success("Keyboard interrupt detected. Exiting miner.")
             break
+        except Exception as e:
+            bt.logging.error(f"Unexpected error in main loop: {e}")
+            traceback.print_exc()
+        finally:
+            # Final cleanup on exit (runs even on exceptions)
+            try:
+                # Cleanup boltz_tmp_files directory
+                boltz_tmp_dir = os.path.join(BASE_DIR, "boltz_tmp_files")
+                if os.path.exists(boltz_tmp_dir):
+                    shutil.rmtree(boltz_tmp_dir)
+                    bt.logging.info(f"Cleaned up boltz_tmp_files directory on exit: {boltz_tmp_dir}")
+            except Exception as cleanup_error:
+                bt.logging.warning(f"Failed to cleanup boltz_tmp_files directory on exit: {cleanup_error}")
 
 
 # ----------------------------------------------------------------------------

@@ -117,7 +117,7 @@ class BoltzWrapper:
         self.max_gpu_memory_usage = self.config.get('max_gpu_memory_usage', 0.90)
         self.max_ram_usage = self.config.get('max_ram_usage', 0.85)
 
-    @profile
+    # @profile
     def preprocess_data_for_boltz(self, valid_molecules_by_uid: dict, score_dict: dict, final_block_hash: str) -> None:
         # Get protein sequence
         self.protein_sequence = get_sequence_from_protein_code(self.subnet_config['weekly_target'])
@@ -277,6 +277,13 @@ properties:
             "write_full_pde": False,
         }
         
+        # Set CUDA device context before loading to ensure models load on correct GPU
+        if torch.cuda.is_available():
+            torch.cuda.set_device(self.device_id)
+            # Clear cache on target device before loading
+            torch.cuda.empty_cache()
+            gc.collect()
+        
         self.structure_model = Boltz2.load_from_checkpoint(
             checkpoint,
             strict=True,
@@ -289,6 +296,9 @@ properties:
             msa_args=asdict(msa_args),
             steering_args=asdict(steering_args),
         )
+        # Explicitly move model to target device (PyTorch Lightning may not respect map_location)
+        if torch.cuda.is_available():
+            self.structure_model = self.structure_model.to(f"cuda:{self.device_id}")
         self.structure_model.eval()
         
         # Load affinity model
@@ -320,6 +330,9 @@ properties:
             steering_args=asdict(steering_args_affinity),
             affinity_mw_correction=self.config.get('affinity_mw_correction', False),
         )
+        # Explicitly move model to target device
+        if torch.cuda.is_available():
+            self.affinity_model = self.affinity_model.to(f"cuda:{self.device_id}")
         self.affinity_model.eval()
         
         # Note: FP16 quantization is handled by PyTorch Lightning trainer with precision="16-mixed"
@@ -338,7 +351,7 @@ properties:
         self._models_loaded = True
         bt.logging.info("Boltz-2 models cached successfully (will reuse in future iterations)")
     
-    @profile
+    # @profile
     def score_molecules_target(self, valid_molecules_by_uid: dict, score_dict: dict, subnet_config: dict, final_block_hash: str) -> None:
         # Preprocess data
         self.subnet_config = subnet_config
@@ -348,6 +361,10 @@ properties:
         # Run Boltz2 for unique molecules
         bt.logging.info(f"Running Boltz2 on GPU {self.device_id}")
         try:
+            # Ensure we're using the correct CUDA device
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.device_id)
+            
             _restore_rng(self._rng0)
             
             # Load models if not cached (first iteration only)
@@ -408,7 +425,7 @@ properties:
         # Collect scores and distribute results to all UIDs
         self.postprocess_data(score_dict)
         # Defer cleanup tp preserve unique_molecules for result submission
-    @profile
+    # @profile
     def postprocess_data(self, score_dict: dict) -> None:
         # Collect scores - Results need to be saved to disk because of distributed predictions
         scores = {}
