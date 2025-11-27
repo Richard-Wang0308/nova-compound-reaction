@@ -799,7 +799,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
-    num_workers: int = 2,
+    num_workers: int = 0,  # Default to 0 to avoid shared memory (shm) bus errors
     override: bool = False,
     seed: Optional[int] = None,
     use_msa_server: bool = False,

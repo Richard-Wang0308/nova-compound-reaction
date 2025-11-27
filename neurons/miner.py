@@ -1686,38 +1686,10 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['psichic_models'][antitarget_protein] = model
                 bt.logging.info(f"Initialized model ({treat_model}) for antitarget: {antitarget_protein}")
         except Exception as e:
-            try:
-                os.system(
-                    f"wget -O {os.path.join(BASE_DIR, 'PSICHIC/trained_weights/TREAT1/model.pt')} "
-                    f"https://huggingface.co/Metanova/TREAT-1/resolve/main/model.pt"
-                )
-                # Retry initialization after download
-                for target_protein in state['current_challenge_targets']:
-                    if target_protein not in state['psichic_models']:
-                        # Determine which TREAT model to use based on protein type
-                        treat_model = get_protein_treat_model(target_protein)
-                        treat_model_path = os.path.join(BASE_DIR, "PSICHIC", "trained_weights", treat_model)
-                        
-                        target_sequence = get_sequence_from_protein_code(target_protein)
-                        model = PsichicWrapper(model_path=treat_model_path)
-                        model.run_challenge_start(target_sequence)
-                        state['psichic_models'][target_protein] = model
-                        bt.logging.info(f"Initialized model ({treat_model}) for target: {target_protein}")
-
-                for antitarget_protein in state['current_challenge_antitargets']:
-                    if antitarget_protein not in state['psichic_models']:
-                        # Determine which TREAT model to use based on protein type
-                        treat_model = get_protein_treat_model(antitarget_protein)
-                        treat_model_path = os.path.join(BASE_DIR, "PSICHIC", "trained_weights", treat_model)
-                        
-                        antitarget_sequence = get_sequence_from_protein_code(antitarget_protein)
-                        model = PsichicWrapper(model_path=treat_model_path)
-                        model.run_challenge_start(antitarget_sequence)
-                        state['psichic_models'][antitarget_protein] = model
-                        bt.logging.info(f"Initialized model ({treat_model}) for antitarget: {antitarget_protein}")
-                bt.logging.info("Models re-downloaded and initialized successfully.")
-            except Exception as e2:
-                bt.logging.error(f"Error initializing models after re-download attempt: {e2}")
+            bt.logging.error(f"Error initializing PSICHIC models: {e}")
+            bt.logging.error("PSICHIC models must be present in PSICHIC/trained_weights/ directory")
+            bt.logging.error("Please ensure TREAT model files are available before running the miner")
+            traceback.print_exc()
 
         # 4) Launch the inference loop
         try:
@@ -1790,38 +1762,10 @@ async def run_miner(config: argparse.Namespace) -> None:
                             state['psichic_models'][antitarget_protein] = model
                             bt.logging.info(f"Initialized model ({treat_model}) for antitarget: {antitarget_protein}")
                 except Exception as e:
-                    try:
-                        os.system(
-                            f"wget -O {os.path.join(BASE_DIR, 'PSICHIC/trained_weights/TREAT1/model.pt')} "
-                            f"https://huggingface.co/Metanova/TREAT-1/resolve/main/model.pt"
-                        )
-                        # Retry initialization after download
-                        for target_protein in state['current_challenge_targets']:
-                            if target_protein not in state['psichic_models']:
-                                # Determine which TREAT model to use based on protein type
-                                treat_model = get_protein_treat_model(target_protein)
-                                treat_model_path = os.path.join(BASE_DIR, "PSICHIC", "trained_weights", treat_model)
-                                
-                                target_sequence = get_sequence_from_protein_code(target_protein)
-                                model = PsichicWrapper(model_path=treat_model_path)
-                                model.run_challenge_start(target_sequence)
-                                state['psichic_models'][target_protein] = model
-                                bt.logging.info(f"Initialized model ({treat_model}) for target: {target_protein}")
-
-                        for antitarget_protein in state['current_challenge_antitargets']:
-                            if antitarget_protein not in state['psichic_models']:
-                                # Determine which TREAT model to use based on protein type
-                                treat_model = get_protein_treat_model(antitarget_protein)
-                                treat_model_path = os.path.join(BASE_DIR, "PSICHIC", "trained_weights", treat_model)
-                                
-                                antitarget_sequence = get_sequence_from_protein_code(antitarget_protein)
-                                model = PsichicWrapper(model_path=treat_model_path)
-                                model.run_challenge_start(antitarget_sequence)
-                                state['psichic_models'][antitarget_protein] = model
-                                bt.logging.info(f"Initialized model ({treat_model}) for antitarget: {antitarget_protein}")
-                        bt.logging.info("Models re-downloaded and initialized successfully.")
-                    except Exception as e2:
-                        bt.logging.error(f"Error initializing models after re-download attempt: {e2}")
+                    bt.logging.error(f"Error initializing PSICHIC models: {e}")
+                    bt.logging.error("PSICHIC models must be present in PSICHIC/trained_weights/ directory")
+                    bt.logging.error("Please ensure TREAT model files are available before running the miner")
+                    traceback.print_exc()
 
                 # Start new inference
                 try:

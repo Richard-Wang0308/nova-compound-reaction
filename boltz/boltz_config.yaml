@@ -16,11 +16,10 @@ batch_predictions: true
 # DataLoader optimization - CRITICAL for performance
 # With batch_size=1 (mandatory for structure prediction), we MUST process many molecules in parallel via workers
 # This prevents GPU from being idle 99% of the time waiting for DataLoader
-# Optimized for 56-core Intel Xeon E5-2680 v4: Use 32 workers (safer than 40 to avoid RAM/CPU overload)
-# Each worker uses ~50-100MB RAM, so 32 workers = ~1.6-3.2GB RAM for DataLoader
-# With 56 cores (112 logical with HT), 32 workers leaves plenty of headroom for system/GPU processes
-# WARNING: If you see OOM errors or CPU > 90%, reduce to 24-28 workers
-num_workers: 32  # Safe for 56-core system: balances performance with memory safety (max 40 if RAM allows)
+# NOTE: Reduced to 0 to avoid shared memory (shm) bus errors
+# Setting to 0 uses main process only, avoiding multiprocessing shared memory issues
+# For better performance with sufficient /dev/shm, can increase to 2-4 workers
+num_workers: 0  # Set to 0 to avoid shared memory bus errors (increase to 2-4 if /dev/shm is large enough)
 
 # Precomputed conformers optimization (LARGEST WIN - saves CPU time)
 # Precompute conformers in parallel before inference to skip expensive RDKit embedding

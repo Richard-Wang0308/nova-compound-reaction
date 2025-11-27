@@ -16,6 +16,12 @@ os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# Set multiprocessing start method to 'spawn' to avoid shared memory (shm) bus errors
+import multiprocessing
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Start method already set
 
 import torch
 torch.use_deterministic_algorithms(True, warn_only=False)
@@ -372,18 +378,31 @@ properties:
             
             # Pass devices as a list to specify which GPU to use
             # PyTorch Lightning uses devices=[1] to select GPU 1, devices=[0] for GPU 0
-            # CRITICAL: Optimize DataLoader performance with aggressive num_workers
-            # With batch_size=1 (mandatory), we MUST process many molecules in parallel via workers
-            # DataLoader does expensive work: file I/O, RDKit parsing, tokenization, structure prep
-            # Default num_workers=2 causes GPU to be idle 99% of the time
-            # Optimized for 56-core Intel Xeon: 32 workers recommended (configurable via boltz_config.yaml)
-            base_num_workers = self.config.get('num_workers', 32)  # Safe default for 56-core system
+            # Set num_workers to avoid shared memory (shm) bus errors
+            # Using 0 workers (main process only) avoids multiprocessing shared memory issues
+            # This is safer and more stable, though slightly slower than multiprocessing
+            base_num_workers = self.config.get('num_workers', 0)  # Default to 0 to avoid shm bus errors
+            
+            # Cap workers at 4 maximum to prevent shared memory issues
+            # Even with spawn method, too many workers can exhaust /dev/shm
+            if base_num_workers > 4:
+                bt.logging.warning(f"num_workers={base_num_workers} is too high, capping at 4 to avoid shared memory issues")
+                base_num_workers = 4
             
             # Adaptive worker adjustment based on available memory
             if self.enable_memory_monitoring:
                 num_workers = self._adjust_workers_for_memory(base_num_workers)
             else:
                 num_workers = base_num_workers
+            
+            # Ensure we don't exceed the cap (prevent shared memory bus errors)
+            num_workers = min(num_workers, 4)
+            
+            # Log worker count for debugging
+            if num_workers > 0:
+                bt.logging.info(f"Using {num_workers} DataLoader workers (capped at 4 to avoid shared memory issues)")
+            else:
+                bt.logging.info("Using main process only (num_workers=0) to avoid shared memory bus errors")
             
             # Check GPU memory before processing
             if torch.cuda.is_available() and self.enable_memory_monitoring:

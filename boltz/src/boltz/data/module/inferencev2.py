@@ -412,15 +412,17 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
             affinity=self.affinity,
             precomputed_conformers_dir=precomputed_dir,
         )
+        # Disable persistent_workers to avoid shared memory issues
+        # When num_workers=0, no multiprocessing is used, avoiding shm bus errors
         return DataLoader(
             dataset,
             batch_size=1,  # Must be 1 for structure prediction (each molecule is a separate structure)
             num_workers=self.num_workers,
-            pin_memory=True,  # Faster CPU->GPU transfer
+            pin_memory=True if self.num_workers == 0 else False,  # Only pin memory with 0 workers to avoid shm issues
             shuffle=False,
             collate_fn=collate,
-            persistent_workers=True if self.num_workers > 0 else False,  # CRITICAL: Keep workers alive between batches (5-10x speedup)
-            prefetch_factor=4 if self.num_workers > 0 else 2,  # Aggressive prefetching to keep GPU fed (more batches ready)
+            persistent_workers=False,  # Disabled to avoid shared memory bus errors
+            prefetch_factor=2 if self.num_workers > 0 else None,  # Reduced prefetch to minimize shared memory usage
         )
 
     def transfer_batch_to_device(
